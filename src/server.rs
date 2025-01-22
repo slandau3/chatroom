@@ -3,7 +3,7 @@ use rand::{thread_rng, Rng};
 use tokio::{
     io::{self, AsyncBufReadExt,AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
 };
 
 type ClientId = u16;
@@ -30,10 +30,13 @@ enum OutgoingMessage {
 /// ServerAction represents an action that's taken by the server.
 /// Currently we only support broadcasting messages but in the future
 /// we may support requesting replays, deletions or announcing logouts. 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ServerAction {
     BroadcastMessage(Message),
-    // TODO: Other actions. Perhaps replay messages to client
+    // There's likely a better way than to send a vector of messages
+    // but this is a simple solution for now.
+    ReplayMessages(oneshot::Sender<Vec<Message>>),
+    // TODO: Other actions. Perhaps announce logouts
 }
 
 impl ToString for OutgoingMessage {
@@ -100,6 +103,21 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// Replay messages that were missed by this client. Broadcasts all messages
+    /// in the chatroom.
+    async fn replay_messages<W: AsyncWriteExt + Unpin>(chatroom: &mut mpsc::Sender<ServerAction>, writer: &mut W) -> Result<(), io::Error> {
+        let (oneshot_producer, oneshot_consumer) = oneshot::channel();
+        chatroom.send(ServerAction::ReplayMessages(oneshot_producer)).await.expect("Couldn't send message");
+
+        let messages = oneshot_consumer.await.expect("Couldn't receive messages");
+
+        for msg in messages {
+            Self::send_message(writer, msg.into()).await?;
+        }
+
+        Ok(())
+    }
+
     /// Main method of ClientConnection. 
     ///
     /// Listens for messages from the client as well
@@ -118,6 +136,9 @@ impl ClientConnection {
 
         // Send login message
         Self::send_message(&mut writer, OutgoingMessage::Login(self.client_id)).await?;
+
+        // Replay messages to client
+        Self::replay_messages(&mut self.chatroom, &mut writer).await?;
 
         loop {
             // We use select here because we don't want one
@@ -237,6 +258,10 @@ impl Chat {
                         eprintln!("Error sending message: {err:?}");
                     }
                 }
+            }
+            ServerAction::ReplayMessages(producer) => {
+                // Send all messages to the client
+                producer.send(self.chat.clone()).unwrap();
             }
         }
     }
