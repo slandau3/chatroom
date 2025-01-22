@@ -17,7 +17,7 @@ Alternatively
 ```
 
 ## Client
-To communicate with the server / act as a member in the chat, we can use `nc` via;
+To communicate with the server / act as a member in the chat, we can use `nc` via:
 
 ```
 nc localhost 8888

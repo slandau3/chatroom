@@ -8,7 +8,8 @@ use tokio::{
 
 type ClientId = u16;
 
-
+/// Message representing a basic message that's either received
+/// by the client or sent from the server.
 #[derive(Debug, Clone)]
 struct Message(ClientId, String);
 
@@ -18,6 +19,7 @@ impl ToString for Message {
     }
 }
 
+/// OutgoingMessage represents a message that's sent to the client.
 #[derive(Debug, Clone)]
 enum OutgoingMessage {
     Message(Message),
@@ -25,6 +27,9 @@ enum OutgoingMessage {
     Ack,
 }
 
+/// ServerAction represents an action that's taken by the server.
+/// Currently we only support broadcasting messages but in the future
+/// we may support requesting replays, deletions or announcing logouts. 
 #[derive(Debug, Clone)]
 enum ServerAction {
     BroadcastMessage(Message),
@@ -56,21 +61,21 @@ impl Into<ServerAction> for Message {
 struct ClientConnection {
     socket: TcpStream,
     client_id: ClientId,
-    producer: mpsc::Sender<ServerAction>,
+    chatroom: mpsc::Sender<ServerAction>,
     consumer: broadcast::Receiver<Message>,
 }
 
 impl ClientConnection {
     fn new(
         socket: TcpStream,
-        producer: mpsc::Sender<ServerAction>,
+        chatroom: mpsc::Sender<ServerAction>,
         consumer: broadcast::Receiver<Message>,
         client_id: ClientId,
     ) -> Self {
         Self {
             socket,
             client_id,
-            producer,
+            chatroom,
             consumer,
         }
     }
@@ -88,13 +93,18 @@ impl ClientConnection {
         Ok(None)
     }
 
+    /// Send a message to the client.
     async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: OutgoingMessage) -> Result<(), io::Error> {
         let msg_str = msg.to_string();
         writer.write_all(msg_str.as_bytes()).await?;
         Ok(())
     }
 
-    async fn listen(&mut self) -> Result<(), io::Error> {
+    /// Main method of ClientConnection. 
+    ///
+    /// Listens for messages from the client as well
+    /// as well as broadcasts messages.
+    pub async fn listen(&mut self) -> Result<(), io::Error> {
         // New client connnection has been established by this point.
         println!(
             "connected {} {}",
@@ -102,6 +112,7 @@ impl ClientConnection {
             self.socket.local_addr().unwrap().port()
         );
 
+        // Readers and Writers
         let (reader, mut writer) = self.socket.split();
         let mut buf_reader = BufReader::new(reader);
 
@@ -109,6 +120,11 @@ impl ClientConnection {
         Self::send_message(&mut writer, OutgoingMessage::Login(self.client_id)).await?;
 
         loop {
+            // We use select here because we don't want one
+            // to block the other.
+            // We could repeatedly consume messages from the chatroom but still
+            // want to read from the client when we're able.
+            // In other words: we need to action on EITHER of these events being READY.
             tokio::select! {
                 // Drain chat & send messages to client
                 result = self.consumer.recv() => {
@@ -124,8 +140,11 @@ impl ClientConnection {
                 result = Self::drain_client_msg(self.client_id, &mut buf_reader) => {
                     match result {
                         Ok(Some(msg)) => {
+                            // Send ACK to client
                             Self::send_message(&mut writer, OutgoingMessage::Ack).await?;
-                            self.producer.send(msg.into()).await.expect("Couldn't send message");
+
+                            // Send message to chatroom
+                            self.chatroom.send(msg.into()).await.expect("Couldn't send message");
                         }
                         Ok(None) => (), // No message from client
                         Err(_e) => {
@@ -175,9 +194,11 @@ impl Server {
             let client_producer = client_msg_producer.clone();
             let chat_receiver = chat_msg_producer.subscribe();
 
+            // Get and increment client id
             let client_user_id = user_id;
             user_id += 1;
 
+            // Create client connection
             tokio::spawn(async move {
                 ClientConnection::new(socket, client_producer, chat_receiver, client_user_id)
                     .listen()
